@@ -13,6 +13,9 @@ import os
 import pickle
 import pstats
 from time import monotonic as clock
+import time
+from typing import DefaultDict
+
 
 import cupy
 import numpy as np
@@ -33,15 +36,16 @@ from utils_multi_node import (
 
 # Must be set _before_ importing RAPIDS libraries (cuDF, RMM)
 os.environ["RAPIDS_NO_INITIALIZE"] = "True"
+from collections import defaultdict
 
 
 import cudf  # noqa
 import rmm  # noqa
 
 
-def sizeof_cudf_dataframe(df):
+def sizeof_cudf_dataframe(dfs):
     return int(
-        sum(col.memory_usage for col in df._data.columns) + df._index.memory_usage()
+        sum(sum(col.memory_usage for col in df._data.columns) + df._index.memory_usage() for df in dfs)
     )
 
 
@@ -51,33 +55,48 @@ def write_chunk(path, df, i_chunk, local_size, chunk_type):
     df.to_parquet(fname)
 
 
-async def send_df(ep, df):
-    header, frames = df.serialize()
-    header["frame_ifaces"] = [f.__cuda_array_interface__ for f in frames]
-    header = pickle.dumps(header)
-    header_nbytes = np.array([len(header)], dtype=np.uint64)
+async def send_df(ep, dfs):
+    headers = []
+    frames = []
+    for id, df in enumerate(dfs):
+        header, frame = df.serialize()
+        header["frame_ifaces"] = [f.__cuda_array_interface__ for f in frame]
+        headers.append(header)
+        frames.append(frame)
+    
+    headers = pickle.dumps(headers)
+    header_nbytes = np.array([len(headers)], dtype=np.uint64)
+
     await ep.send(header_nbytes)
-    await ep.send(header)
-    for frame in frames:
-        await ep.send(frame)
+    await ep.send(headers)
+
+    for id, df in enumerate(dfs):
+        for frame in frames[id]:
+            await ep.send(frame)
 
 
 async def recv_df(ep):
+    cudf_typ = [0 for _ in range(2)]
     header_nbytes = np.empty((1,), dtype=np.uint64)
     await ep.recv(header_nbytes)
-    header = bytearray(header_nbytes[0])
-    await ep.recv(header)
-    header = pickle.loads(header)
 
-    frames = [
-        cupy.empty(iface["shape"], dtype=iface["typestr"])
-        for iface in header["frame_ifaces"]
-    ]
-    for frame in frames:
-        await ep.recv(frame)
+    headers = bytearray(header_nbytes[0])
+    await ep.recv(headers)
+    hlen = header_nbytes[0]
+    headers = pickle.loads(headers)
 
-    cudf_typ = pickle.loads(header["type-serialized"])
-    return cudf_typ.deserialize(header, frames)
+    for id in range(2):
+        header = headers[id]
+        frames = [
+            cupy.empty(iface["shape"], dtype=iface["typestr"])
+            for iface in header["frame_ifaces"]
+        ]
+        for frame in frames:
+            await ep.recv(frame)
+        
+        cudf_typ[id] = pickle.loads(header["type-serialized"])
+        cudf_typ[id] = cudf_typ[id].deserialize(header, frames)
+    return (cudf_typ[0], cudf_typ[1])
 
 
 async def barrier(rank, eps):
@@ -94,38 +113,44 @@ async def send_bins(eps, bins):
     await asyncio.gather(*futures)
 
 
-async def recv_bins(eps, bins):
+async def recv_bins(eps, ret):
     futures = []
     for ep in eps.values():
         futures.append(recv_df(ep))
-    bins.extend(await asyncio.gather(*futures))
+    objs = await asyncio.gather(*futures)
+    for obj in objs:
+        ret[0].append(obj[0])
+        ret[1].append(obj[1])
 
 
 async def exchange_and_concat_bins(rank, eps, bins, timings=None):
-    ret = [bins[rank]]
+    ret = [[bins[rank][0]], [bins[rank][1]]]
     if timings is not None:
         t1 = clock()
     await asyncio.gather(recv_bins(eps, ret), send_bins(eps, bins))
-    if timings is not None:
-        t2 = clock()
-        timings.append(
-            (
-                t2 - t1,
-                sum(
-                    [sizeof_cudf_dataframe(b) for i, b in enumerate(bins) if i != rank]
-                ),
+    for id in range(2):
+        if timings is not None:
+            t2 = clock()
+            timings.append(
+                (
+                    t2 - t1,
+                    sum(
+                        [sizeof_cudf_dataframe(b) for i, b in enumerate(bins) if i != rank]
+                    ),
+                )
             )
-        )
-    return cudf.concat(ret)
+    return cudf.concat(ret[0]), cudf.concat(ret[1])
 
 
 async def distributed_join(args, rank, eps, left_table, right_table, timings=None):
     left_bins = left_table.partition_by_hash(["key"], args.n_chunks)
     right_bins = right_table.partition_by_hash(["key"], args.n_chunks)
+    bins = list(zip(left_bins, right_bins))
 
-    left_df = await exchange_and_concat_bins(rank, eps, left_bins, timings)
-    right_df = await exchange_and_concat_bins(rank, eps, right_bins, timings)
-    return left_df.merge(right_df, on="key")
+    left_df, right_df = await exchange_and_concat_bins(rank, eps, bins, timings)
+
+    df = left_df.merge(right_df, on="key")
+    return df
 
 
 def generate_chunk(i_chunk, local_size, num_chunks, chunk_type, frac_match):
@@ -141,6 +166,12 @@ def generate_chunk(i_chunk, local_size, num_chunks, chunk_type, frac_match):
             "payload": cupy.arange(local_size, dtype="int64"),
         }
     )
+    # df = cudf.DataFrame(
+    #     {
+    #         "key": cupy.random.randint(0, 100, size=100000, dtype="int64")[0:10000],
+    #         "payload": cupy.arange(10000, dtype="int64"),
+    #     }
+    # )
     if chunk_type == "left":
         # Left dataframe
         #
@@ -250,6 +281,9 @@ async def worker(rank, eps, args):
 
     iter_results = {"bw": [], "wallclock": [], "throughput": [], "data_processed": []}
     timings = []
+    iter_data_processed = len(left_df) * sum([t.itemsize for t in left_df.dtypes])
+    iter_data_processed += len(right_df) * sum([t.itemsize for t in right_df.dtypes])
+
     t1 = clock()
     for i in range(args.iter):
         iter_timings = []
@@ -276,8 +310,6 @@ async def worker(rank, eps, args):
         del result_df
 
         iter_bw = sum(t[1] for t in iter_timings) / sum(t[0] for t in iter_timings)
-        iter_data_processed = len(left_df) * sum([t.itemsize for t in left_df.dtypes])
-        iter_data_processed += len(right_df) * sum([t.itemsize for t in right_df.dtypes])
         iter_throughput = args.n_chunks * iter_data_processed / iter_took
 
         iter_results["bw"].append(iter_bw)
@@ -308,7 +340,6 @@ async def worker(rank, eps, args):
         "data_processed": data_processed,
         "iter_results": iter_results,
     }
-
 
 def parse_args():
     parser = argparse.ArgumentParser(description="")
